@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdfaudiobook"
+version = "0.3.0"
+description = "Turn PDF books, including ones with broken fonts, scans, and equations, into chaptered audiobooks."
+requires-python = ">=3.10"
+dependencies = [
+    "pymupdf>=1.24",
+    "piper-tts>=1.2",
+    "pyttsx3>=2.90",
+    "opencv-python-headless>=4.8",
+    "numpy",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+math = ["pix2tex>=0.1.2"]
+dev = ["pytest", "reportlab", "pypdf", "matplotlib"]
+
+[project.scripts]
+pdfaudiobook = "pdfaudiobook.cli:main"
+
+[project.gui-scripts]
+pdfaudiobook-gui = "pdfaudiobook.gui:main"
+
+[tool.setuptools]
+packages = ["pdfaudiobook"]
+
+[tool.setuptools.package-data]
+pdfaudiobook = ["sre_server.mjs"]
