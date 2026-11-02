@@ -155,8 +155,11 @@ class MathOCR:
         the others, cancels out scale-specific errors.
         """
         if cls._model is None:
+            import torch
             from pix2tex.cli import LatexOCR
 
+            # Half the cores: all of them freezes a desktop PC during a long import.
+            torch.set_num_threads(max(1, (os.cpu_count() or 2) // 2))
             cls._model = LatexOCR()
         # Tall regions (matrices, multi-line) take far longer per pass; one
         # mid-scale pass keeps a 700-page book within reason.
@@ -195,6 +198,14 @@ def looks_like_latex(tex: str) -> bool:
     if re.search(r"(.{3,})\1{4,}", tex):  # decoder stuck in a loop
         return False
     if len(_NONSENSE_RE.findall(tex)) >= 4:  # a diagram decoded as "math"
+        return False
+    # Signs of a table or figure read by the image model: braces under or
+    # over numbers, arrays, and "10 to the degree" (it reads small exponent
+    # digits it can't see as \circ).
+    if re.search(r"\\(under|over)brace|\\begin\{array\}", tex) or tex.count("^{\\circ}") >= 2:
+        return False
+    # Chained arrows between stacked numbers: a table column read as math.
+    if tex.count("\\longrightarrow") >= 2 or re.search(r"10\^\{[.\\]", tex):
         return False
     return bool(re.search(r"[=+\-^_\\]|\d", tex))
 
@@ -237,6 +248,39 @@ def _group_subscripts(tex: str) -> str:
     return _SUBSCRIPTED_RE.sub(fix, tex)
 
 
+# A subscript of three or more letters is a word label (I_ave, Q_electron,
+# V_out), which SRE would spell out letter by letter ("sub a v e"); as
+# \text{} it is read as one word ("sub ave").
+_WORD_SUB_RE = re.compile(r"_\{\s*([A-Za-z](?:\s*[A-Za-z]){2,})\s*\}")
+
+
+def _word_subscripts(tex: str) -> str:
+    return _WORD_SUB_RE.sub(lambda m: "_{\\text{" + re.sub(r"\s+", "", m.group(1)) + "}}", tex)
+
+
+# Words the book prints between two equations on one line ("V = U/q  or
+# dV = dU/q") come out of the glyph rebuild glued to the next symbol
+# ("orV_{B}"), and SRE reads them as variables o times r. Mark them as text.
+_CONNECTIVE_RE = re.compile(r"(?<![A-Za-z\\])\s*(or|and)\s*(?=[A-Z\\(∆Δ])")
+
+
+def _connectives(tex: str) -> str:
+    tex = _CONNECTIVE_RE.sub(lambda m: "\\text{ " + m.group(1) + " }", tex)
+    # Image-model styling: \mathrm makes SRE say "normal I", and a unit word
+    # in \mathrm is spelled letter by letter; keep the letter, read the word.
+    tex = re.sub(r"\\(textstyle|displaystyle)\b", "", tex)
+    tex = re.sub(r"\\operatorname\*?\{(lim|sin|cos|tan|log|ln|exp)\}", r"\\\1", tex)
+    tex = re.sub(r"\\mathrm\{\\Delta\}", "∆", tex)
+    tex = re.sub(r"\\math(?:rm|sf)\{\s*\{?([A-Za-z]{2,}[A-Za-z/]*)\}?\s*\}", r"\\text{\1}", tex)
+    tex = re.sub(r"\\math(rm|sf)\{", "{", tex)
+    # SRE says "lim over t right arrow 0 of"; say it the way a lecturer does.
+    tex = re.sub(r"\\lim_\{(.+?)\\to\s*(.+?)\}",
+                 r"\\text{the limit as }\1\\text{ approaches }\2\\text{ of }", tex)
+    # SRE reads a capital delta as "triangle" (or "increment" for U+2206);
+    # in a physics text it is always "delta", as in delta Q over delta t.
+    return re.sub(r"\\Delta(?![A-Za-z])|[∆Δ]", r"\\text{delta}\\,", tex)
+
+
 class MathSpeaker:
     """LaTeX to English. Uses SRE through one long-lived Node process."""
 
@@ -274,7 +318,7 @@ class MathSpeaker:
     def speak(self, tex: str) -> str:
         if self.proc:
             try:
-                self.proc.stdin.write(json.dumps(_group_subscripts(tex)) + "\n")
+                self.proc.stdin.write(json.dumps(_group_subscripts(_word_subscripts(_connectives(tex)))) + "\n")
                 self.proc.stdin.flush()
                 out = json.loads(self.proc.stdout.readline())
                 if out:
@@ -290,7 +334,26 @@ class MathSpeaker:
         # SRE says "x dot above" for \dot{x}; engineers say "x dot".
         text = text.replace(" dot above", " dot").replace(" double dot above", " double dot")
         text = text.replace("[equation]", " An equation appears here. ")
+        text = text.replace("[table]", " A table appears here. ")
         return re.sub(r"[ \t]+", " ", text).replace(" .", ".")
+
+
+_ARROWS_RE = re.compile(r"\\(long)?(right|left|leftright)arrow\b|\\to\b")
+
+
+def reconcile_relations(tex: str, printed: str) -> str:
+    """Correct the image model's relation symbols using the text layer.
+
+    pix2tex sometimes reads a wide "=" as an arrow ("x long right arrow ...").
+    When the page's own glyphs for the formula hold "=" and no arrow, every
+    arrow in the LaTeX is that "=".
+    """
+    if "=" in printed and not any(a in printed for a in "→←↔⟶⟵⇒⇐⇔"):
+        tex = _ARROWS_RE.sub("=", tex)
+    # It also reads a printed increment sign ∆ as a capital lambda.
+    if any(c in printed for c in "∆Δ") and "Λ" not in printed:
+        tex = tex.replace("\\Lambda", "\\Delta")
+    return tex
 
 
 # Built-in verbalizer: covers the common school/undergrad constructs so math

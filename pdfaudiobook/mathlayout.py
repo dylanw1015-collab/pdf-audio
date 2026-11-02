@@ -27,7 +27,7 @@ ACCENTS = {"\u0307": r"\dot", "\u0308": r"\ddot", "\u0302": r"\hat", "\u0303": r
            "\u20d7": r"\vec", "˙": r"\dot", "¨": r"\ddot", "ˆ": r"\hat", "^": r"\hat", "˜": r"\tilde", "~": r"\tilde",
            "¯": r"\bar", "→": r"\vec", "⃗": r"\vec", "´": r"\acute", "`": r"\grave"}
 OPS = set("=+−-×÷·<>≤≥≠≈≡∼∝±∓∈∉⊂⊆∪∩→←↔⇒⇔∀∃∂∇∑∏∫∮√∞/|()[]{},.;:!′″")
-EQ_NUM_RE = re.compile(r"^\(\d+(\.\d+)*[a-z]?\)$")
+EQ_NUM_RE = re.compile(r"^\(\d+(\.\d+)*(\.?[a-z])?\)$")  # (2.1), (3a), (2.2.a)
 
 
 @dataclass
@@ -46,10 +46,18 @@ class Glyph:
         return (self.x0 + self.x1) / 2
 
 
+# Adobe's Symbol font puts the pieces of tall brackets in the Private Use
+# Area (U+F8EB..F8FE: parenlefttp, parenleftex, ... bracerightbt; Adobe
+# Glyph List). Their Unicode equivalents are the bracket pieces U+239B..23AD.
+_SYMBOL_PUA = dict(zip(range(0xF8EB, 0xF8FF), "⎛⎜⎝⎡⎢⎣⎧⎨⎩⎪⎮⎞⎟⎠⎤⎥⎦⎫⎬⎭"))
+
+
 def glyphs_of_line(line: dict) -> list[Glyph]:
     out = []
     for s in line["spans"]:
         for ch in s["chars"]:
+            if ord(ch["c"][:1] or " ") in _SYMBOL_PUA:
+                ch["c"] = _SYMBOL_PUA[ord(ch["c"])]
             x0, y0, x1, y1 = ch["bbox"]
             oy = ch["origin"][1]
             if re.search(r"CMEX|EXTENSION", s["font"], re.I):
@@ -267,6 +275,28 @@ def is_complex(glyphs: list[Glyph], bars: list[tuple], body_size: float) -> bool
         r = sorted(r, key=lambda g: g.x0)
         return any(b.x0 - a.x1 > 2.0 * body_size for a, b in zip(r, r[1:]))
     return sum(cells_gap(r) for r in rows) >= 2
+
+
+def is_table(glyphs: list[Glyph], body_size: float, width: float) -> bool:
+    """A table of numbers caught as "math": three or more rows, or two rows
+    of three or more cells, with cells separated by wide gaps, no tall
+    brackets (those make it a matrix), and mostly digits. Read aloud it is
+    a run of numbers, so it is announced instead."""
+    vis = [g for g in glyphs if not g.c.isspace()]
+    if any(g.c in BIG_DELIMS for g in vis) or not vis:
+        return False
+    digits = sum(g.c.isdigit() for g in vis) / len(vis)
+
+    def cells(r):
+        r = sorted(r, key=lambda g: g.x0)
+        return 1 + sum(1 for a, b in zip(r, r[1:]) if b.x0 - a.x1 > 1.5 * body_size)
+    counts = [cells(r) for r in _rows(vis)]
+    wide = sum(1 for c in counts if c >= 3)
+    if width <= 12 * body_size:
+        return False
+    # One row of a table can arrive alone ("1.57×10^6   8.47×10^28   4.7").
+    return (digits > 0.4 and (wide >= 2 or (wide >= 1 and len(counts) >= 3))) or \
+        (digits > 0.6 and max(counts) >= 3 and not any(g.c == "=" for g in vis))
 
 
 def bands(glyphs: list[Glyph], bars: list[tuple]) -> list[tuple[list[Glyph], list[tuple]]]:
@@ -586,6 +616,11 @@ def repair_unknown_glyphs(page, raw: dict, cache: dict) -> None:
                     c = _name_to_char(name)
                     if c == ch["c"] and font in symbolish:
                         c = None
+                if c is None and not greek and name == ch["c"] and name.isascii() and name.isalpha():
+                    # The glyph name and the decoded character agree on a
+                    # Latin letter: two independent sources, so keep it.
+                    # (Shape matching an italic "n" picked the similar "Π".)
+                    c = name
                 if c is None:
                     c = match_outline(fg[0], fg[1], hit[1], greek_only=greek and len(name) == 1)
                     if not greek and c in ("Σ", "Π"):
