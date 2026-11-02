@@ -1,0 +1,14 @@
+{
+  "name": "Read-Along",
+  "short_name": "Read-Along",
+  "description": "Offline read-along books: the original pages, highlighted as they're read, at any speed.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#fbfaf6",
+  "theme_color": "#fbfaf6",
+  "icons": [
+    {"src": "icon-180.png", "sizes": "180x180", "type": "image/png"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png"}
+  ]
+}

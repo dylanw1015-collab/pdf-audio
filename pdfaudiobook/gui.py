@@ -38,16 +38,46 @@ class Player:
         self.proc = None
         self.stop_evt = threading.Event()
 
+    def _play_stream(self, path: str) -> bool:
+        """Write the passage into one long-lived output stream. Opening a device per passage costs
+        over a second on some Windows drivers (a pause) and a timed stop clips the last words."""
+        import numpy as np
+
+        with wave.open(path) as w:
+            sr, ch = w.getframerate(), w.getnchannels()
+            data = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).reshape(-1, ch)
+        if getattr(self, "_fmt", None) != (sr, ch):
+            if getattr(self, "_out", None):
+                self._out.close()
+            self._out = self._sd.OutputStream(samplerate=sr, channels=ch, dtype="int16")
+            self._out.start()
+            self._fmt = (sr, ch)
+        for i in range(0, len(data), sr // 10):
+            if self.stop_evt.is_set():
+                self._out.abort()  # drops what is buffered, so Pause/Skip are instant
+                self._out.start()
+                return False
+            self._out.write(data[i:i + sr // 10])
+        return True
+
     def play(self, path: str) -> bool:
         """Play to the end (True) or until stop() (False). Call from a worker thread."""
         self.stop_evt.clear()
+        try:
+            import sounddevice as _sd
+
+            self._sd = _sd
+        except (ImportError, OSError):
+            _sd = None
+        if _sd:
+            return self._play_stream(path)
         with wave.open(path) as w:
             secs = w.getnframes() / w.getframerate()
         if sys.platform == "win32":
             import winsound
 
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            done = not self.stop_evt.wait(secs + 0.05)
+            done = not self.stop_evt.wait(secs + 0.5)  # extra for the driver's start-up delay
             if not done:
                 winsound.PlaySound(None, 0)
             return done
@@ -80,9 +110,12 @@ class Reader(tk.Tk):
         self.passages: list[str] = []
         self.prects: list[list] = []  # per passage: [(page, (x0, y0, x1, y1)), ...] in PDF points
         self.doc = None
-        self.page_img = None  # (page, zoom, PhotoImage), kept so Tk does not drop it
+        self.page_range = (0, 0)  # first and last page of the chapter shown in the Page tab
+        self.layout = None  # (key, total height, {page: (x, y, height, zoom)}): where each page sits on the canvas
+        self.pimgs: dict[int, tk.PhotoImage] = {}  # pages drawn right now; kept so Tk does not drop them
         self.cur_page, self.cur_rects = 0, []
         self.playing = False
+        self.gen = 0  # bumped on every (re)start of speech; the worker drops anything older
         self.player = Player()
         self.events: queue.Queue = queue.Queue()
         self.jobs: queue.Queue = queue.Queue()
@@ -112,24 +145,26 @@ class Reader(tk.Tk):
         self.speed_lbl = ttk.Label(bar, text="1.0×", width=5)
         self.speed_lbl.pack(side="left")
         ttk.Button(bar, text="Export audiobook…", command=self.export).pack(side="right")
+        ttk.Button(bar, text="Export for iPhone…", command=self.export_epub).pack(side="right")
+        ttk.Button(bar, text="⛶ Full screen (F11)", command=self.toggle_fullscreen).pack(side="right", padx=4)
 
-        body = ttk.PanedWindow(self, orient="horizontal")
+        body = self.body = ttk.PanedWindow(self, orient="horizontal")
         body.pack(fill="both", expand=True, padx=6)
-        left = ttk.Frame(body)
+        left = self.left = ttk.Frame(body)
         ttk.Label(left, text="Chapters").pack(anchor="w")
         self.chlist = tk.Listbox(left, activestyle="dotbox", exportselection=False, width=34)
         self.chlist.pack(fill="both", expand=True)
         self.chlist.bind("<<ListboxSelect>>", self._chapter_clicked)
         body.add(left, weight=1)
-        tabs = ttk.Notebook(body)
+        tabs = self.tabs = ttk.Notebook(body)
         pagef = ttk.Frame(tabs)
-        self.canvas = tk.Canvas(pagef, background="#555555", highlightthickness=0)
+        self.canvas = tk.Canvas(pagef, background="#555555", highlightthickness=0, yscrollincrement=40)
         csb = ttk.Scrollbar(pagef, command=self.canvas.yview)
-        self.canvas.config(yscrollcommand=csb.set)
+        self.canvas.config(yscrollcommand=lambda a, b: (csb.set(a, b), self.after_idle(self._rerender)))
         csb.pack(side="right", fill="y")
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Button-1>", self._page_clicked)
-        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        self.canvas.bind("<MouseWheel>", lambda e: self.canvas.yview_scroll(-3 * (e.delta // 120), "units"))
         self.canvas.bind("<Configure>", lambda _e: self.after(150, self._rerender))
         tabs.add(pagef, text="Page")
         right = ttk.Frame(tabs)
@@ -149,9 +184,29 @@ class Reader(tk.Tk):
         self.prog = ttk.Progressbar(foot, length=180, mode="determinate")
         self.prog.pack(side="right")
         ttk.Label(foot, textvariable=self.status).pack(side="left")
-        self.bind("<space>", lambda e: self.toggle())
+        self.bind("<F11>", lambda e: self.toggle_fullscreen())
+        self.bind("<Escape>", lambda e: self.toggle_fullscreen(False))
+        # Space pauses from anywhere. Widgets have their own space action (a focused button
+        # presses itself, the text pane eats the key), which made it fire twice or not at all.
+        pause = lambda e: (self.toggle(), "break")[1]
+        self.bind("<space>", pause)
+        for cls in ("TButton", "Listbox", "Text", "Canvas", "TNotebook", "TScale"):
+            self.bind_class(cls, "<space>", pause)
+        self.bind_class("TButton", "<KeyRelease-space>", lambda e: "break")
         self.bind("<Left>", lambda e: self.skip(-1))
         self.bind("<Right>", lambda e: self.skip(1))
+
+    def toggle_fullscreen(self, on=None):
+        """Full screen gives the page the whole window: the chapter list is hidden until Esc."""
+        on = not self.attributes("-fullscreen") if on is None else on
+        if on == bool(self.attributes("-fullscreen")):
+            return
+        self.attributes("-fullscreen", on)
+        if on:
+            self.body.forget(self.left)
+            self.tabs.select(0)
+        else:
+            self.body.insert(0, self.left, weight=1)
 
     # ------------------------------------------------------------ book
     def open_pdf(self, path: str | None = None):
@@ -165,6 +220,12 @@ class Reader(tk.Tk):
             from .book import load_book
 
             try:
+                # shortcut: skip the slow image model (pix2tex, ~25 s per hard equation); most equations are
+                # rebuilt from glyph positions in milliseconds, hard ones (matrices) become "an equation appears
+                # here". Upgrade: re-read those with pix2tex in the background per chapter.
+                from .math import MathOCR
+
+                MathOCR.disabled = True
                 b = load_book(path, progress=lambda i, n, _p: self.events.put(("progress", i, n)))
                 self.events.put(("loaded", path, b))
             except Exception as e:  # show any failure in the window
@@ -210,7 +271,9 @@ class Reader(tk.Tk):
         self.text.config(state="disabled")
         # Equations are turned into words by the speech thread (SRE lives there).
         self.jobs.put(("prepare", self.ch, spoken_text(self.book["chapters"][self.ch]), k))
-        self.show_page(self.book["chapters"][self.ch].start_page, [])
+        c = self.book["chapters"][self.ch]
+        self.page_range = (c.start_page, c.end_page)
+        self.show_page(c.start_page, [])
 
     def _passage_rects(self, passages, owners, nparts):
         """Page rectangles for each passage, by its share of its paragraph's characters.
@@ -268,40 +331,82 @@ class Reader(tk.Tk):
 
     # ------------------------------------------------------------ page view
     def show_page(self, pno, rects):
+        """Show the page being read. The view only moves when the passage is off screen, and then it
+        snaps to the top of that page's spread, so the text stays still while you read it."""
         self.cur_page, self.cur_rects = pno, rects
+        lo, hi = self.page_range
+        if not lo <= pno <= hi:  # a passage on a page outside the shown range: widen it
+            self.page_range = (min(lo, pno), max(hi, pno))
         self._rerender()
-        if rects and self.page_img:
-            self.canvas.yview_moveto(max(0, (rects[0][1] * self.page_img[1] - 60) / self.page_img[2].height()))
+        _x, y, h, z = self.layout[2][pno]
+        top, view = self.canvas.canvasy(0), max(self.canvas.winfo_height(), 1)
+        r0 = y + (rects[0][1] * z if rects else 0)
+        r1 = y + (rects[-1][3] * z if rects else 0)
+        if not rects or r0 < top or r1 > top + view:
+            self.canvas.yview_moveto(y / self.layout[1])
+            if rects and r1 > y + view:  # the page is taller than the window: bring the passage into view
+                self.canvas.yview_moveto(max(0, r0 - 40) / self.layout[1])
+        self._rerender()
 
-    def _rerender(self):
+    def _rerender(self, force=False):
+        """Lay the chapter out as book spreads (two pages across, left page = odd index,
+        so page 1 stands alone on the right like a real book); draw only spreads in view."""
         if not self.doc:
             return
         import pymupdf
 
-        pno = max(0, min(self.cur_page, len(self.doc) - 1))
-        page = self.doc[pno]
-        z = max(self.canvas.winfo_width(), 300) / page.rect.width
-        if not self.page_img or self.page_img[:2] != (pno, z):
-            pix = page.get_pixmap(matrix=pymupdf.Matrix(z, z))
-            self.page_img = (pno, z, tk.PhotoImage(data=pix.tobytes("ppm")))
-        self.canvas.delete("all")
-        img = self.page_img[2]
-        self.canvas.create_image(0, 0, anchor="nw", image=img)
-        for x0, y0, x1, y1 in self.cur_rects:
-            self.canvas.create_rectangle(x0 * z, y0 * z, x1 * z, y1 * z, outline="#e08000", width=2,
-                                         fill="#ffd400", stipple="gray25")
-        self.canvas.config(scrollregion=(0, 0, img.width(), img.height()))
+        lo, hi = self.page_range
+        hi = min(hi, len(self.doc) - 1)
+        w = max(self.canvas.winfo_width(), 400)
+        key = (lo, hi, w)
+        if force or not self.layout or self.layout[0] != key:
+            half = w / 2
+            geo, y = {}, 0
+            for a in range(lo if lo % 2 else lo - 1, hi + 1, 2):  # a = left page of the spread
+                row = [n for n in (a, a + 1) if lo <= n <= hi]
+                zs = {n: half / self.doc[n].rect.width for n in row}
+                rowh = max(self.doc[n].rect.height * zs[n] for n in row)
+                for n in row:
+                    geo[n] = (0 if n == a else half, y, self.doc[n].rect.height * zs[n], zs[n])
+                y += rowh + 10
+            self.layout = (key, y, geo)
+            self.pimgs.clear()
+            self.canvas.delete("all")
+            self.canvas.config(scrollregion=(0, 0, w, y))
+        geo = self.layout[2]
+        top, bot = self.canvas.canvasy(0), self.canvas.canvasy(self.canvas.winfo_height())
+        pad = bot - top  # one screen of spreads ahead and behind, so scrolling shows no gaps
+        for n, (x, y, h, z) in geo.items():
+            seen = y + h >= top - pad and y <= bot + pad
+            if seen and n not in self.pimgs:
+                pix = self.doc[n].get_pixmap(matrix=pymupdf.Matrix(z, z))
+                self.pimgs[n] = tk.PhotoImage(data=pix.tobytes("ppm"))
+                self.canvas.create_image(x, y, anchor="nw", image=self.pimgs[n], tags=f"pg{n}")
+            elif not seen and n in self.pimgs:
+                self.canvas.delete(f"pg{n}")
+                del self.pimgs[n]
+        self.canvas.delete("hl")
+        if self.cur_page in geo:
+            x, y, _h, z = geo[self.cur_page]
+            for x0, y0, x1, y1 in self.cur_rects:
+                self.canvas.create_rectangle(x + x0 * z, y + y0 * z, x + x1 * z, y + y1 * z, outline="#e08000",
+                                             width=2, fill="#ffd400", stipple="gray25", tags="hl")
 
     def _page_clicked(self, e):
-        if not self.page_img:
+        if not self.layout:
             return
-        pno, z, _ = self.page_img
-        x, y = self.canvas.canvasx(e.x) / z, self.canvas.canvasy(e.y) / z
+        cx, cy = self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+        half = self.layout[0][2] / 2
+        hit = next((n for n, (x, y, h, _z) in self.layout[2].items() if x <= cx < x + half and y <= cy < y + h), None)
+        if hit is None:
+            return
+        x, y, _h, z = self.layout[2][hit]
+        px, py = (cx - x) / z, (cy - y) / z
         best, dist = None, 1e9
         for k, rects in enumerate(self.prects):
             for q, (x0, y0, x1, y1) in rects:
-                if q == pno:
-                    d = max(x0 - x, 0, x - x1) + max(y0 - y, 0, y - y1)
+                if q == hit:
+                    d = max(x0 - px, 0, px - x1) + max(y0 - py, 0, py - y1)
                     if d < dist:
                         best, dist = k, d
         if best is not None:
@@ -353,7 +458,8 @@ class Reader(tk.Tk):
 
     def _speak_current(self):
         if self.passages:
-            self.jobs.put(("speak", self.ch, self.k, self.passages, round(self.rate.get(), 1)))
+            self.gen += 1
+            self.jobs.put(("speak", self.ch, self.k, self.passages, round(self.rate.get(), 1), self.gen))
 
     def _speech_worker(self):
         """Owns the TTS engine and the math speaker; runs every speech job."""
@@ -369,7 +475,8 @@ class Reader(tk.Tk):
 
         speaker, engine, eng_rate = None, None, None
         tmp = tempfile.mkdtemp(prefix="pdfab_gui_")
-        made: dict[tuple, str] = {}
+        made: dict[str, str] = {}
+        synth_lock = threading.Lock()
         try:  # load the voice while the book loads, so the first Play is not silent for ~10 s
             self.events.put(("status", "Loading the voice…"))
             engine, eng_rate = get_engine(rate=1.0), 1.0
@@ -395,27 +502,36 @@ class Reader(tk.Tk):
                         owners += [i] * len(c)
                     self.events.put(("passages", ch, passages, k, owners, len(parts)))
                     continue
-                _, ch, k, passages, rate = job
+                _, ch, k, passages, rate, gen = job
                 if engine is None or rate != eng_rate:
                     self.events.put(("status", "Loading the voice…"))
                     engine, eng_rate, made = get_engine(rate=rate), rate, {}
                     self.events.put(("status", f"Voice: {engine.name}, speed {rate}×"))
 
                 def wav_for(i):
-                    key = (ch, i)
-                    if key not in made:
-                        p = os.path.join(tmp, f"{ch}_{i}.wav")
-                        engine.to_wav(passages[i], p)
-                        made[key] = p
-                    return made[key]
+                    key = passages[i]  # by text, so a stale passage number can never play the wrong audio
+                    with synth_lock:  # the voice is not thread-safe; the prefetch thread must not overlap
+                        if key not in made:
+                            p = os.path.join(tmp, f"{len(made)}.wav")
+                            engine.to_wav(key, p)
+                            made[key] = p
+                        return made[key]
 
-                wav = wav_for(k)
-                if k + 1 < len(passages):  # make the next passage while this one plays
-                    threading.Thread(target=wav_for, args=(k + 1,), daemon=True).start()
-                if not self.playing or ch != self.ch or k != self.k:
-                    continue
-                if self.player.play(wav) and self.playing:
-                    self.events.put(("advance", ch, k))
+                # Play on from here without waiting for the window: redrawing and saving the place
+                # take longer than the audio buffer, which is what made the gap between passages.
+                while k < len(passages):
+                    wav = wav_for(k)
+                    if k + 1 < len(passages):  # make the next passage while this one plays
+                        threading.Thread(target=wav_for, args=(k + 1,), daemon=True).start()
+                    if not self.playing or gen != self.gen:
+                        break
+                    self.events.put(("show", ch, k, gen))
+                    if not self.player.play(wav):
+                        break
+                    k += 1
+                else:
+                    if self.playing and gen == self.gen:
+                        self.events.put(("advance", ch, len(passages) - 1, gen))
             except Exception as e:
                 self.events.put(("error", f"Speech failed: {e}"))
 
@@ -431,7 +547,9 @@ class Reader(tk.Tk):
                     self._show_book(ev[1], ev[2])
                 elif kind == "passages":
                     self._show_passages(*ev[1:])
-                elif kind == "advance" and ev[1] == self.ch and ev[2] == self.k:
+                elif kind == "show" and ev[3] == self.gen and ev[1] == self.ch:
+                    self.highlight(ev[2])  # follow the voice; it has already moved on by itself
+                elif kind == "advance" and ev[3] == self.gen and ev[1] == self.ch:
                     self.skip(1)
                 elif kind == "status":
                     self.status.set(ev[1])
@@ -440,7 +558,7 @@ class Reader(tk.Tk):
                     messagebox.showerror("PDF Audiobook", ev[1])
         except queue.Empty:
             pass
-        self.after(50, self._pump)
+        self.after(15, self._pump)
 
     # ------------------------------------------------------------ events
     def _chapter_clicked(self, _e):
@@ -481,6 +599,31 @@ class Reader(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def export_epub(self):
+        """Read-along EPUB: the original pages, highlighted as they are read
+        (play it in Apple Books with Read Aloud). The speed slider sets the
+        narration speed, since Books has no speed control of its own."""
+        if not self.book:
+            return
+        out = filedialog.askdirectory(title="Folder for the read-along EPUB")
+        if not out:
+            return
+        self.stop()
+        self.status.set("Exporting read-along EPUB (original pages + highlighted narration)…")
+
+        def work():
+            from .epub import export_epub
+            from .tts import get_engine
+
+            try:
+                path = export_epub(self.pdf, self.book, get_engine(rate=round(self.rate.get(), 2)), out,
+                                   log=lambda m: self.events.put(("status", str(m))))
+                self.events.put(("status", f"Wrote {path}. Copy it to your iPhone and open it in Books."))
+            except Exception as e:
+                self.events.put(("error", f"Export failed: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
     # ------------------------------------------------------------ place
     def _load_place(self):
         try:
@@ -510,6 +653,12 @@ class Reader(tk.Tk):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    try:  # long imports must not make the rest of the PC sluggish
+        import psutil
+
+        psutil.Process().nice(psutil.BELOW_NORMAL_PRIORITY_CLASS if sys.platform == "win32" else 10)
+    except Exception:
+        pass
     Reader(argv[0] if argv else None).mainloop()
 
 

@@ -64,6 +64,13 @@ def cmd_export(a):
     eng = get_engine(a.engine, a.voice, a.rate)
     print(f"Using TTS engine: {eng.name}")
     out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.pdf)), b["title"] + "_audio")
+    if a.format == "epub":
+        from .epub import export_epub
+
+        only = _parse_range(a.only, len(b["chapters"]), b["chapters"], a.all) if (a.only or a.all) else None
+        print("Wrote:\n  " + export_epub(a.pdf, b, eng, out, only, width_px=a.page_width,
+                                                    crop=a.crop, strips=a.strips))
+        return
     files = export_book(b, eng, out, a.format, _parse_range(a.only, len(b["chapters"]), b["chapters"], a.all))
     print("Wrote:\n  " + "\n  ".join(files))
 
@@ -131,7 +138,12 @@ def main(argv=None):
     r.add_argument("--chapter", type=int, help="start at this chapter")
     r.set_defaults(f=cmd_read)
     e = sub.add_parser("export", parents=[common, tts], help="write audio files per chapter")
-    e.add_argument("--format", choices=["mp3", "m4b", "mp3+m4b", "wav"], default="mp3+m4b")
+    e.add_argument("--format", choices=["mp3", "m4b", "mp3+m4b", "wav", "epub"], default="mp3+m4b",
+                   help="epub: the original pages with read-along highlighting (Apple Books Read Aloud)")
+    e.add_argument("--page-width", type=int, default=1100, help="epub page image width in pixels")
+    e.add_argument("--strips", type=int, default=1,
+                   help="epub: cut each page into N strips for reading with the phone sideways (3 is ~85%% of print size)")
+    e.add_argument("--crop", action="store_true", help="epub: trim the white page margins (default: show the whole page; pinch to zoom)")
     e.add_argument("--only", help="chapters to export, e.g. 1-3")
     e.add_argument("-o", "--out", help="output folder")
     e.set_defaults(f=cmd_export)

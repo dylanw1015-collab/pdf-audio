@@ -14,6 +14,31 @@ pdfaudiobook export    book.pdf              # MP3 per chapter + one .m4b with c
 pdfaudiobook text      book.pdf --only 3 --spoken   # check what will be said, equations included
 ```
 
+## On your iPhone: original pages, highlighted as they're read
+
+```
+pdfaudiobook export book.pdf --format epub              # whole pages, pinch to zoom
+pdfaudiobook export book.pdf --format epub --rate 1.5   # narration 1.5x faster
+pdfaudiobook export book.pdf --format epub --strips 3   # 3 strips per page, for reading sideways
+```
+
+Or click *Export for iPhone…* in the desktop window. Your PC does all the hard work (broken fonts, OCR, equations, voice). It writes one `.epub` holding every page of the PDF as it was printed, figures and equations included, plus the narration. The phone only plays it, so it works in airplane mode.
+
+To get it onto the phone: put the `.epub` in iCloud Drive or OneDrive (or AirDrop / email it to yourself). On the iPhone, open the Files app, tap the file, tap Share, then tap Books. In Books, use the speaker (Read Aloud) button to start. The sentence being read is highlighted in yellow, and you can turn on automatic page turns in the Read Aloud settings.
+
+| Choice | Why / evidence |
+|---|---|
+| EPUB 3 Media Overlays (SMIL) | The open standard for text synced to recorded audio. The reader adds the `media:active-class` class to the sentence being read ([W3C EPUB Media Overlays](https://w3c.github.io/epub-specs/archive/epub32/spec/epub-mediaoverlays.html)). |
+| Fixed-layout pages | Apple Books plays Read Aloud "only in fixed-layout books" ([Apple Books Asset Guide](https://help.apple.com/itc/booksassetguide/en.lproj/itc6db639756.html)). It doesn't for reflowable EPUBs ([MobileRead test](https://www.mobileread.com/forums/showthread.php?p=4227408)). |
+| Page image + highlight boxes | Shows the real page with nothing re-typeset. The boxes come from the line positions kept during extraction. Where a sentence starts mid-line, the position is estimated by character count, so the edge can be a few letters off. |
+| Whole pages, nothing trimmed | The page is exactly as printed; pinch to zoom in Books. An iPhone 15 screen is 2.56 in wide (1179 px at 460 ppi), so a whole Letter page shows at about 30% of print size before zooming. `--crop` trims the white margins (about 40%). |
+| Speed set at export (`--rate`) | Books' Read Aloud has no speed control, so the speed is built into the narration. Piper's `length_scale` stretches phoneme durations in the model itself (it is 1/rate), so faster speech keeps the same pitch, unlike speeding up a recording ([Piper voice config](https://github.com/rhasspy/piper/blob/master/TRAINING.md)). |
+| `--strips 3` | Turned sideways, the screen is about 5.5 x 2.56 in, so a third of a page shows at about 85% of print size. Cuts snap to blank rows so no line is sliced. A sentence that crosses a cut is split, and its audio is divided by length. |
+| AAC .m4a audio | A core EPUB audio type, and the format in Apple's Read Aloud samples. |
+| Validated | Every sample EPUB passes [EPUBCheck](https://github.com/w3c/epubcheck) 5.1.0 with 0 errors and 0 warnings. `tests/test_epub.py` checks that every audio clip fits its file and every box fits its page. |
+
+Known limits: pages from sideways scans that had to be rotated for OCR are shown but not highlighted. Size is about 21 MB per hour of narration plus about 150 KB per page.
+
 ## Install
 
 1. **Python 3.10+**, then from this folder: `pip install -e ".[math]"`. The `[math]` part adds equation recognition, which pulls in PyTorch (about 200 MB on CPU). Leave it out if your books have no math.
